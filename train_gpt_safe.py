@@ -77,14 +77,14 @@ class Hyperparameters:
     lawa_freq = int(os.environ.get("LAWA_FREQ", 100))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
-    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))  # QAT from step 1 (local exp: best post-quant loss)
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))  # If 1: QAT from step 1. If 0: use late_qat_threshold
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
-    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
+    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.50))  # QAT at 50% warmdown (scale<0.50)
     eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 0.90))  # T=0.90 validated for relu²/leaky_relu²
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
@@ -763,7 +763,27 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
+    @staticmethod
+    def _bank_ste(w: Tensor, x_dtype: torch.dtype = torch.bfloat16) -> Tensor:
+        """STE int6 fake-quant for bank weights. Operates at bf16 precision to match export."""
+        if CastedLinear._qat_state[0] and w.ndim == 2:
+            w_bf16 = w.to(x_dtype)
+            with torch.no_grad():
+                w32 = w_bf16.float()
+                row_max = w32.abs().amax(dim=1)
+                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x_dtype)
+            return w_bf16 + (w_q - w_bf16).detach()
+        return w
+
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+        if self.training and CastedLinear._qat_state[0]:
+            q_w = self._bank_ste(q_w)
+            k_w = self._bank_ste(k_w)
+            v_w = self._bank_ste(v_w)
+            out_w = self._bank_ste(out_w)
+            up_w = self._bank_ste(up_w)
+            down_w = self._bank_ste(down_w)
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)

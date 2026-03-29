@@ -51,8 +51,8 @@ export SWA_ENABLED=1
 export SWA_EVERY=50
 
 # Our changes:
-export QAT_ENABLED=1               # QAT from step 1 (local exp: best post-quant loss)
-export LATE_QAT_THRESHOLD=0        # Disabled — QAT already on from start
+export QAT_ENABLED=0               # Use late_qat_threshold to activate
+export LATE_QAT_THRESHOLD=0.50     # QAT at 50% warmdown — balances quality vs step overhead
 export EVAL_TEMPERATURE=0.90       # Temperature calibration (validated for relu²)
 export TTT_ENABLED=1               # Keep TTT (proven -0.0025 BPB)
 export TTT_LR=0.002
