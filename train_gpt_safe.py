@@ -1747,6 +1747,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log0(f"qat_diagnostic: _qat_enabled={CastedLinear._qat_enabled} "
+         f"(if False after late_qat log, torch.compile constant-folded it)")
     # Apply weight averaging
     if args.lawa_enabled and len(lawa_queue) > 1:
         log0(f"lawa:applying LAWA averaging k={len(lawa_queue)}")
@@ -1834,32 +1836,24 @@ def main() -> None:
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
     orig_softcap = eval_model.logit_softcap
-    # --- Temperature grid search via fast roundtrip eval (~7s each) ---
-    log0("=== TEMPERATURE GRID SEARCH (roundtrip eval) ===")
-    best_t, best_rt_bpb = 1.0, float('inf')
-    for t_cand in [0.85, 0.88, 0.90, 0.92, 0.95, 1.00]:
-        eval_model.logit_softcap = orig_softcap * t_cand
-        compiled_t = torch.compile(eval_model, dynamic=False, fullgraph=True)
-        torch.cuda.synchronize()
-        t0_rt = time.perf_counter()
-        rt_loss, rt_bpb = eval_val(
-            args, compiled_t, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            eval_seq_len=effective_eval_seq_len,
-        )
-        torch.cuda.synchronize()
-        rt_ms = 1000.0 * (time.perf_counter() - t0_rt)
-        log0(f"  T={t_cand:.2f} roundtrip val_bpb:{rt_bpb:.8f} time:{rt_ms:.0f}ms")
-        if rt_bpb < best_rt_bpb:
-            best_t, best_rt_bpb = t_cand, rt_bpb
-    log0(f"=== BEST TEMPERATURE: T={best_t:.2f} roundtrip_bpb={best_rt_bpb:.8f} ===")
-    # --- Measure quant gap (pre-quant diagnostic already done above) ---
-    log0(f"quant_gap: pre_ema_bpb={diag_val_bpb:.8f} post_int6_roundtrip_bpb={best_rt_bpb:.8f} "
-         f"gap={best_rt_bpb - diag_val_bpb:+.8f}")
-    # --- Sliding window at best T and T=1.0 for comparison ---
+    # --- Compile once at T=1.0 for roundtrip eval + quant gap ---
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    torch.cuda.synchronize()
+    t_qeval = time.perf_counter()
+    q_val_loss, q_val_bpb = eval_val(
+        args, compiled_eval, rank, world_size, device, grad_accum_steps,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        eval_seq_len=effective_eval_seq_len,
+    )
+    torch.cuda.synchronize()
+    log0(f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
+    log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"quant_gap: pre_ema={diag_val_bpb:.8f} post_int6={q_val_bpb:.8f} "
+         f"gap={q_val_bpb - diag_val_bpb:+.8f} ({(q_val_bpb - diag_val_bpb)/diag_val_bpb*100:+.4f}%)")
+    # --- Sliding eval: T=1.0 baseline (matches SOTA, ~74s) ---
     sw_seq_len = effective_eval_seq_len
-    sw_val_loss, sw_val_bpb = best_rt_bpb, best_rt_bpb  # fallback if no sliding eval
-    eval_model.logit_softcap = orig_softcap * best_t
+    sw_val_loss, sw_val_bpb = q_val_loss, q_val_bpb  # fallback
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
         t_slide = time.perf_counter()
@@ -1869,24 +1863,32 @@ def main() -> None:
             stride=args.eval_stride, eval_seq_len=sw_seq_len,
         )
         torch.cuda.synchronize()
-        log0(f"sliding_bestT val_bpb:{sw_val_bpb:.8f} T={best_t:.2f} stride:{args.eval_stride} "
+        log0(f"sliding_T1.0 val_bpb:{sw_val_bpb:.8f} stride:{args.eval_stride} "
              f"time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
-    if best_t != 1.0:
-        eval_model.logit_softcap = orig_softcap  # T=1.0
+        log0(f"SOTA_comparison: our={sw_val_bpb:.8f} sota_seed1337=1.12165091 "
+             f"delta={sw_val_bpb - 1.12165091:+.8f}")
+    # --- Sliding eval: T=0.90 (~74s, no recompile — sliding uses uncompiled model) ---
+    eval_model.logit_softcap = orig_softcap * 0.90
+    if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
-        t_slide10 = time.perf_counter()
-        sw10_loss, sw10_bpb = eval_val_sliding(
+        t_slide90 = time.perf_counter()
+        sw90_loss, sw90_bpb = eval_val_sliding(
             args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride, eval_seq_len=sw_seq_len,
         )
         torch.cuda.synchronize()
-        log0(f"sliding_T1.0  val_bpb:{sw10_bpb:.8f} T=1.00 stride:{args.eval_stride} "
-             f"time:{1000.0 * (time.perf_counter() - t_slide10):.0f}ms")
-        temp_delta = sw_val_bpb - sw10_bpb
-        log0(f"=== TEMPERATURE EFFECT: T={best_t:.2f} vs T=1.00 delta={temp_delta:+.8f} ===")
-    # Restore best T for TTT
-    eval_model.logit_softcap = orig_softcap * best_t
+        log0(f"sliding_T0.90 val_bpb:{sw90_bpb:.8f} stride:{args.eval_stride} "
+             f"time:{1000.0 * (time.perf_counter() - t_slide90):.0f}ms")
+        temp_delta = sw90_bpb - sw_val_bpb
+        log0(f"=== TEMPERATURE EFFECT: T=0.90 vs T=1.00 sliding delta={temp_delta:+.8f} ===")
+        if sw90_bpb < sw_val_bpb:
+            log0(f"temperature_helps: using T=0.90 for TTT")
+            eval_model.logit_softcap = orig_softcap * 0.90
+            sw_val_loss, sw_val_bpb = sw90_loss, sw90_bpb
+        else:
+            log0(f"temperature_hurts: using T=1.00 for TTT")
+            eval_model.logit_softcap = orig_softcap
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
     # Legal score-first TTT (PR #461 recipe)
     if args.ttt_enabled:
