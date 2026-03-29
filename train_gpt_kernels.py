@@ -800,28 +800,26 @@ class Block(nn.Module):
         else:
             self.dtg_gate = None
     @staticmethod
-    def _maybe_ste(w: Tensor) -> Tensor:
-        """Apply STE or Noisy QAT int6 fake-quant to bank weights during QAT."""
+    def _maybe_ste(w: Tensor, x_dtype: torch.dtype = torch.bfloat16) -> Tensor:
+        """Apply STE or Noisy QAT int6 fake-quant to bank weights during QAT.
+        Returns bf16 tensor ready for F.linear — caller must NOT re-cast.
+        Quantization operates at bf16 precision to match actual int6 export."""
         if CastedLinear._qat_state[0] and w.ndim == 2:
+            w_bf16 = w.to(x_dtype)
             if CastedLinear._noisy_qat[0]:
-                # Noisy QAT: differentiable noise at int6 step size
                 with torch.no_grad():
-                    amax = w.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+                    amax = w_bf16.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
                     step_size = amax / 31.0
-                noise = (torch.rand_like(w) - 0.5) * step_size.to(w.dtype)
-                return w + noise
+                noise = (torch.rand_like(w_bf16) - 0.5) * step_size.to(w_bf16.dtype)
+                return w_bf16 + noise
             else:
-                # Standard STE
-                w_bf16 = w.to(torch.bfloat16) if w.dtype != torch.bfloat16 else w
-                if _HAS_TRITON_KERNELS:
-                    w_q = ste_int6_fakequant(w_bf16)
-                else:
-                    with torch.no_grad():
-                        w32 = w.float()
-                        row_max = w32.abs().amax(dim=1)
-                        scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                        w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(w.dtype)
-                return w + (w_q - w).detach()
+                with torch.no_grad():
+                    w32 = w_bf16.float()
+                    row_max = w32.abs().amax(dim=1)
+                    scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                    w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x_dtype)
+                # STE: forward uses quantized, backward uses original
+                return w_bf16 + (w_q - w_bf16).detach()
         return w
 
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
