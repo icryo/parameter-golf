@@ -77,7 +77,7 @@ class Hyperparameters:
     lawa_freq = int(os.environ.get("LAWA_FREQ", 100))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
-    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))  # QAT from step 1 (local exp: best post-quant loss)
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
