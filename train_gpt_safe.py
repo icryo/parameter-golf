@@ -99,6 +99,7 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_reset_every = int(os.environ.get("TTT_RESET_EVERY", 0))  # Reset weights every N chunks (0=disabled)
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1127,9 +1128,24 @@ def eval_val_sliding_ttt(
          f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
 
     optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    # Save original weights for periodic reset (prevents TTT drift)
+    ttt_reset_every = getattr(args, 'ttt_reset_every', 0)
+    if ttt_reset_every > 0:
+        original_state = {n: t.detach().clone() for n, t in base_model.state_dict().items()}
+        log0(f"ttt_sliding:reset_every={ttt_reset_every} chunks")
     t0 = time.perf_counter()
 
     for ci in range(num_chunks):
+        # Periodic reset: restore original weights to prevent drift
+        if ttt_reset_every > 0 and ci > 0 and ci % ttt_reset_every == 0:
+            with torch.no_grad():
+                for n, t in base_model.named_parameters():
+                    if n in original_state:
+                        t.copy_(original_state[n])
+            # Reset optimizer momentum
+            optimizer.state.clear()
+            if rank == 0:
+                log0(f"  ttt_reset at chunk {ci}/{num_chunks}")
         windows = chunk_windows[ci]
         if not windows:
             continue

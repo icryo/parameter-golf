@@ -136,8 +136,8 @@ def run_sliding(label, temp=1.0, stride=64):
     del model; torch.cuda.empty_cache()
     return bpb, elapsed
 
-def run_ttt(label, temp=1.0, ttt_lr=0.002, ttt_epochs=3, freeze_blocks=0, stride=64):
-    log(f'  [{label}] T={temp:.2f} lr={ttt_lr} ep={ttt_epochs} freeze={freeze_blocks}...')
+def run_ttt(label, temp=1.0, ttt_lr=0.002, ttt_epochs=3, freeze_blocks=0, stride=64, reset_every=0):
+    log(f'  [{label}] T={temp:.2f} lr={ttt_lr} ep={ttt_epochs} freeze={freeze_blocks} reset={reset_every}...')
     model = load_eval_model(softcap_scale=temp)
     args.ttt_lr = ttt_lr
     args.ttt_epochs = ttt_epochs
@@ -146,6 +146,7 @@ def run_ttt(label, temp=1.0, ttt_lr=0.002, ttt_epochs=3, freeze_blocks=0, stride
     args.ttt_momentum = 0.9
     args.ttt_batch_seqs = 32
     args.ttt_grad_clip = 1.0
+    args.ttt_reset_every = reset_every
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     loss, bpb = eval_val_sliding_ttt(
@@ -196,9 +197,13 @@ results['ttt_pr1039'] = bpb_b
 bpb_c, t_c = run_ttt('ttt_5ep', temp=best_t, ttt_lr=0.002, ttt_epochs=5, freeze_blocks=0)
 results['ttt_5ep'] = bpb_c
 
-# Config D: Higher LR + more epochs (aggressive)
-bpb_d, t_d = run_ttt('ttt_hiLR_4ep', temp=best_t, ttt_lr=0.003, ttt_epochs=4, freeze_blocks=0)
-results['ttt_hiLR_4ep'] = bpb_d
+# Config D: PR #1039 + periodic reset every 100 chunks (anti-drift)
+bpb_d, t_d = run_ttt('ttt_reset100', temp=best_t, ttt_lr=0.0025, ttt_epochs=4, freeze_blocks=0, reset_every=100)
+results['ttt_reset100'] = bpb_d
+
+# Config E: Reset every 50 chunks (more aggressive anti-drift)
+bpb_e, t_e = run_ttt('ttt_reset50', temp=best_t, ttt_lr=0.0025, ttt_epochs=4, freeze_blocks=0, reset_every=50)
+results['ttt_reset50'] = bpb_e
 
 # --- Summary ---
 log('')
@@ -216,13 +221,14 @@ for t in [0.85, 0.88, 0.90, 0.92, 0.95, 1.00]:
 
 log('')
 log('TTT configurations:')
-log(f'  SOTA (lr=0.002, 3ep):         bpb={bpb_a:.8f}')
-log(f'  PR1039 (lr=0.0025, 4ep):      bpb={bpb_b:.8f}  delta={bpb_b-bpb_a:+.8f}')
-log(f'  5 epochs (lr=0.002, 5ep):     bpb={bpb_c:.8f}  delta={bpb_c-bpb_a:+.8f}')
-log(f'  Aggressive (lr=0.003, 4ep):   bpb={bpb_d:.8f}  delta={bpb_d-bpb_a:+.8f}')
+log(f'  SOTA (lr=0.002, 3ep):              bpb={bpb_a:.8f}')
+log(f'  PR1039 (lr=0.0025, 4ep):           bpb={bpb_b:.8f}  delta={bpb_b-bpb_a:+.8f}')
+log(f'  5 epochs (lr=0.002, 5ep):          bpb={bpb_c:.8f}  delta={bpb_c-bpb_a:+.8f}')
+log(f'  PR1039 + reset/100 (anti-drift):   bpb={bpb_d:.8f}  delta={bpb_d-bpb_a:+.8f}')
+log(f'  PR1039 + reset/50 (anti-drift):    bpb={bpb_e:.8f}  delta={bpb_e-bpb_a:+.8f}')
 
 log('')
-best_ttt = min(bpb_a, bpb_b, bpb_c, bpb_d)
+best_ttt = min(bpb_a, bpb_b, bpb_c, bpb_d, bpb_e)
 log(f'SOTA reference (seed 1337): 1.11922988')
 log(f'Our best result:            {best_ttt:.8f}')
 log(f'Delta vs SOTA:              {best_ttt - 1.11922988:+.8f}')
