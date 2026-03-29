@@ -77,15 +77,15 @@ class Hyperparameters:
     lawa_freq = int(os.environ.get("LAWA_FREQ", 100))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
-    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))  # If 1: QAT from step 1. If 0: use late_qat_threshold
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
-    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.50))  # QAT at 50% warmdown (scale<0.50)
-    eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 0.90))  # T=0.90 validated for relu²/leaky_relu²
+    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
+    eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 0.90))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
@@ -540,12 +540,10 @@ class RMSNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 class CastedLinear(nn.Linear):
-    # Mutable container: torch.compile cannot constant-fold list contents
-    _qat_state: list[bool] = [False]
-
+    _qat_enabled: bool = False
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
-        if self._qat_state[0] and self.training and w.ndim == 2:
+        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
             with torch.no_grad():
                 w32 = self.weight.float()
                 row_max = w32.abs().amax(dim=1)
@@ -763,27 +761,7 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    @staticmethod
-    def _bank_ste(w: Tensor, x_dtype: torch.dtype = torch.bfloat16) -> Tensor:
-        """STE int6 fake-quant for bank weights. Operates at bf16 precision to match export."""
-        if CastedLinear._qat_state[0] and w.ndim == 2:
-            w_bf16 = w.to(x_dtype)
-            with torch.no_grad():
-                w32 = w_bf16.float()
-                row_max = w32.abs().amax(dim=1)
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x_dtype)
-            return w_bf16 + (w_q - w_bf16).detach()
-        return w
-
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
-        if self.training and CastedLinear._qat_state[0]:
-            q_w = self._bank_ste(q_w)
-            k_w = self._bank_ste(k_w)
-            v_w = self._bank_ste(v_w)
-            out_w = self._bank_ste(out_w)
-            up_w = self._bank_ste(up_w)
-            down_w = self._bank_ste(down_w)
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
@@ -1476,7 +1454,7 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
-    CastedLinear._qat_state[0] = args.qat_enabled
+    CastedLinear._qat_enabled = args.qat_enabled
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1696,8 +1674,8 @@ def main() -> None:
             break
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_state[0]:
-            CastedLinear._qat_state[0] = True
+        if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
+            CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -1855,11 +1833,9 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    # Temperature scaling: scale logit_softcap to calibrate confidence
     if args.eval_temperature > 0 and args.eval_temperature != 1.0:
-        orig_softcap = eval_model.logit_softcap
-        eval_model.logit_softcap = orig_softcap * args.eval_temperature
-        log0(f"temperature:applied T={args.eval_temperature:.2f} softcap:{orig_softcap:.1f}->{eval_model.logit_softcap:.1f}")
+        eval_model.logit_softcap = eval_model.logit_softcap * args.eval_temperature
+        log0(f"temperature:applied T={args.eval_temperature:.2f} softcap->{eval_model.logit_softcap:.1f}")
     compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
@@ -1907,19 +1883,6 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
-    # Stride=16 evaluation (measures best possible non-TTT BPB)
-    if args.eval_stride != 16 and 16 < sw_seq_len:
-        torch.cuda.synchronize()
-        t_slide16 = time.perf_counter()
-        sw16_val_loss, sw16_val_bpb = eval_val_sliding(
-            args, eval_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=16, eval_seq_len=sw_seq_len,
-        )
-        torch.cuda.synchronize()
-        log0(f"final_int6_sliding_window_s16 val_loss:{sw16_val_loss:.4f} val_bpb:{sw16_val_bpb:.4f} "
-             f"stride:16 eval_time:{1000.0 * (time.perf_counter() - t_slide16):.0f}ms")
-        log0(f"final_int6_sliding_window_s16_exact val_loss:{sw16_val_loss:.8f} val_bpb:{sw16_val_bpb:.8f}")
     # Legal score-first TTT (PR #461 recipe)
     if args.ttt_enabled:
         torch.cuda.synchronize()
