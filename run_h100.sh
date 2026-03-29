@@ -188,13 +188,17 @@ log(f'--- TTT sweep (T={best_t:.2f}, stride=64) ---')
 bpb_a, t_a = run_ttt('ttt_sota', temp=best_t, ttt_lr=0.002, ttt_epochs=3, freeze_blocks=0)
 results['ttt_sota'] = bpb_a
 
-# Config B: Higher LR (more aggressive adaptation)
-bpb_b, t_b = run_ttt('ttt_hiLR', temp=best_t, ttt_lr=0.004, ttt_epochs=3, freeze_blocks=0)
-results['ttt_hiLR'] = bpb_b
+# Config B: PR #1039 recipe (claimed 1.1184 BPB — potential record)
+bpb_b, t_b = run_ttt('ttt_pr1039', temp=best_t, ttt_lr=0.0025, ttt_epochs=4, freeze_blocks=0)
+results['ttt_pr1039'] = bpb_b
 
 # Config C: More epochs (deeper adaptation)
 bpb_c, t_c = run_ttt('ttt_5ep', temp=best_t, ttt_lr=0.002, ttt_epochs=5, freeze_blocks=0)
 results['ttt_5ep'] = bpb_c
+
+# Config D: Higher LR + more epochs (aggressive)
+bpb_d, t_d = run_ttt('ttt_hiLR_4ep', temp=best_t, ttt_lr=0.003, ttt_epochs=4, freeze_blocks=0)
+results['ttt_hiLR_4ep'] = bpb_d
 
 # --- Summary ---
 log('')
@@ -212,12 +216,13 @@ for t in [0.85, 0.88, 0.90, 0.92, 0.95, 1.00]:
 
 log('')
 log('TTT configurations:')
-log(f'  SOTA (lr=0.002, 3ep):     bpb={bpb_a:.8f}')
-log(f'  High LR (lr=0.004, 3ep):  bpb={bpb_b:.8f}  delta={bpb_b-bpb_a:+.8f}')
-log(f'  More epochs (lr=0.002, 5ep): bpb={bpb_c:.8f}  delta={bpb_c-bpb_a:+.8f}')
+log(f'  SOTA (lr=0.002, 3ep):         bpb={bpb_a:.8f}')
+log(f'  PR1039 (lr=0.0025, 4ep):      bpb={bpb_b:.8f}  delta={bpb_b-bpb_a:+.8f}')
+log(f'  5 epochs (lr=0.002, 5ep):     bpb={bpb_c:.8f}  delta={bpb_c-bpb_a:+.8f}')
+log(f'  Aggressive (lr=0.003, 4ep):   bpb={bpb_d:.8f}  delta={bpb_d-bpb_a:+.8f}')
 
 log('')
-best_ttt = min(bpb_a, bpb_b, bpb_c)
+best_ttt = min(bpb_a, bpb_b, bpb_c, bpb_d)
 log(f'SOTA reference (seed 1337): 1.11922988')
 log(f'Our best result:            {best_ttt:.8f}')
 log(f'Delta vs SOTA:              {best_ttt - 1.11922988:+.8f}')
