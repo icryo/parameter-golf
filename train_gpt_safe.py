@@ -85,7 +85,7 @@ class Hyperparameters:
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
-    eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 0.90))  # T=0.90 optimal for relu²/leaky_relu² activations
+    eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 0.90))  # T=0.90 validated for relu²/leaky_relu²
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")

@@ -66,7 +66,7 @@ export SWA_EVERY=50
 # QAT defaults
 export QAT_ENABLED=0
 export LATE_QAT_THRESHOLD=0.15
-export NOISY_QAT=1
+export NOISY_QAT=0
 
 # TTT defaults
 export TTT_ENABLED=0
@@ -102,7 +102,7 @@ case "$EXPERIMENT" in
   noisy_qat)
     # SOTA + kernels + Noisy QAT (key innovation: fixes broken QAT)
     export RUN_ID="noisy_qat_s${SEED}"
-    export NOISY_QAT=1
+    export NOISY_QAT=0
     export TTT_ENABLED=1
     SCRIPT="train_gpt_kernels.py"
     echo "=== Noisy QAT + Kernels seed=$SEED ==="
@@ -111,7 +111,7 @@ case "$EXPERIMENT" in
   full)
     # All optimizations stacked
     export RUN_ID="full_s${SEED}"
-    export NOISY_QAT=1
+    export NOISY_QAT=0
     export TTT_ENABLED=1
     export BIGRAM_VOCAB_SIZE=3072  # Larger bigram (from SOTA ablation: -0.0009)
     export EVAL_TEMPERATURE=0     # Auto-calibrate temperature
@@ -133,7 +133,7 @@ case "$EXPERIMENT" in
     # Test larger BigramHash
     export RUN_ID="ablation_bigram10k_s${SEED}"
     export BIGRAM_VOCAB_SIZE=10240
-    export NOISY_QAT=1
+    export NOISY_QAT=0
     export TTT_ENABLED=0
     SCRIPT="train_gpt_kernels.py"
     echo "=== Ablation: BigramHash 10240 seed=$SEED ==="

@@ -90,7 +90,7 @@ class Hyperparameters:
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
-    noisy_qat = bool(int(os.environ.get("NOISY_QAT", "1")))  # Use differentiable noise QAT (better than STE)
+    noisy_qat = bool(int(os.environ.get("NOISY_QAT", "0")))  # Noisy QAT WORSE than STE on flat arch (local experiment confirmed)
     eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 0.0))  # Post-training temp calibration (0=disabled)
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
