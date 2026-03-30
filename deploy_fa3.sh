@@ -25,7 +25,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -2
-pip install wheel packaging ninja numpy sentencepiece huggingface-hub datasets tqdm 2>&1 | tail -2
+pip install wheel packaging ninja numpy sentencepiece huggingface-hub datasets tqdm brotli 2>&1 | tail -2
 
 # Install FA3 pre-built wheel (seconds, no compilation)
 pip install --no-cache-dir "https://download.pytorch.org/whl/cu128/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_28_x86_64.whl" 2>&1 | tail -2
@@ -92,6 +92,7 @@ export LATE_QAT_THRESHOLD=0.15
 export XSA_LAST_N=11
 export BIGRAM_VOCAB_SIZE=2816 BIGRAM_DIM=112
 export USE_GPTQ=1 GPTQ_RESERVE_MS=9000
+export MIXED_PRECISION=1 TARGET_BYTES=16000000
 export TTT_ENABLED=0
 
 torchrun --standalone --nproc_per_node=$NGPU train_gpt_merged.py
