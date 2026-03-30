@@ -77,6 +77,9 @@ export TIE_EMBEDDINGS=1 ROPE_DIMS=16 LN_SCALE=1
 export VE_ENABLED=1 VE_DIM=128 VE_LAYERS="9,10"
 export LOGIT_SOFTCAP=30.0
 export MATRIX_LR=0.025 SCALAR_LR=0.025 TIED_EMBED_LR=0.035
+# Tuning from top PRs (proven, env-var only):
+export MUON_BACKEND_STEPS=4        # PR #1089: 4 NS steps (faster per-step, ~1-2ms saved)
+export BIGRAM_VOCAB_SIZE=4096      # PR #1072: larger bigram hash (more n-gram patterns)
 export MUON_MOMENTUM=0.99 MUON_MOMENTUM_WARMUP_START=0.92 MUON_MOMENTUM_WARMUP_STEPS=1500
 export MUON_WD=0.04 ADAM_WD=0.04 GRAD_CLIP_NORM=0.3
 export SWA_ENABLED=1 SWA_EVERY=50
