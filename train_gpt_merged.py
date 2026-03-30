@@ -515,7 +515,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gates,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,ngram_gate,resid_lambdas",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gates,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,ngram_gate",
     ).split(",")
     if pattern
 )
@@ -1033,19 +1033,13 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
-    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, resid_lambda_attn: Tensor | None = None, resid_lambda_mlp: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed)
-        if resid_lambda_attn is not None:
-            x_out = resid_lambda_attn * x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        else:
-            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        if resid_lambda_mlp is not None:
-            x_out = resid_lambda_mlp * x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
-        else:
-            x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
-        return x_out
+        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        mlp_out = self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        return x_out + mlp_out
 
 class GPT(nn.Module):
     def __init__(
@@ -1097,7 +1091,6 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5, dtype=torch.float32))
         # Parameter banks: contiguous 3D tensors for batched optimizer
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
@@ -1189,14 +1182,12 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         ve_cache: dict = {}
-        rl = self.resid_lambdas.to(dtype=x.dtype)
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
             x = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve,
-                resid_lambda_attn=rl[i, 0], resid_lambda_mlp=rl[i, 1])
+                v_embed=ve)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -1209,8 +1200,7 @@ class GPT(nn.Module):
             x = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve,
-                resid_lambda_attn=rl[bi, 0], resid_lambda_mlp=rl[bi, 1])
+                v_embed=ve)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1233,14 +1223,12 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         ve_cache: dict = {}
-        rl = self.resid_lambdas.to(dtype=x.dtype)
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
             x = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve,
-                resid_lambda_attn=rl[i, 0], resid_lambda_mlp=rl[i, 1])
+                v_embed=ve)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -1253,8 +1241,7 @@ class GPT(nn.Module):
             x = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve,
-                resid_lambda_attn=rl[bi, 0], resid_lambda_mlp=rl[bi, 1])
+                v_embed=ve)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -2038,17 +2025,11 @@ def main() -> None:
         weight_decay=args.adam_wd,
         fused=True,
     )
-    resid_lambda_lr = 5.0 * args.scalar_lr
-    optimizer_resid = torch.optim.AdamW(
-        [{"params": [base_model.resid_lambdas], "lr": resid_lambda_lr, "base_lr": resid_lambda_lr}],
-        betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=0.0, fused=True,
-    )
     # Non-bank params that need manual all-reduce (replicated across GPUs)
     replicated_params = list(optimizer_tok.param_groups[0]["params"])
     for pg in optimizer_tok.param_groups[1:]:
         replicated_params.extend(pg["params"])
     replicated_params.extend(scalar_params)
-    replicated_params.append(base_model.resid_lambdas)
 
     optimizer_head = None
     if base_model.lm_head is not None:
@@ -2059,7 +2040,7 @@ def main() -> None:
             fused=True,
         )
         replicated_params.append(base_model.lm_head.weight)
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_resid]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if optimizer_head is not None:
         optimizers.append(optimizer_head)
     # EngramLite proj uses its own Muon optimizer (small matrix, not worth banking)
