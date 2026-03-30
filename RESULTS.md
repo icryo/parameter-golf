@@ -79,3 +79,29 @@
 - `run_ttt_only.py` — standalone TTT eval on saved checkpoint
 - `run_h100.sh` — full experiment runner
 - `run_1gpu_test.sh` — 1xH100 validation script
+
+## Run 2: 8xH100 Node 2 (FA2 + Fused Kernel Fix)
+
+- **Attention**: FA2 (flash-attn 2.8.3 via patched CUDA check)
+- **Fused MLP**: Fixed import from separate file — loaded and verified 1.33x speedup
+  - But only saves 5ms/step (MLP not the bottleneck)
+- **ms/step**: 100ms (still SDPA/FA2-limited)
+- **Steps**: 5,844
+- **Sliding BPB**: **1.1172**
+
+### Fused Kernel Benchmark (H100)
+- Unfused MLP: 2.01 ms/call
+- Fused MLP:   1.51 ms/call  
+- Speedup: 1.33x (0.49ms × 11 layers = 5.4ms/step)
+- Total step still 100ms — attention is the bottleneck, not MLP
+
+## Final Assessment
+
+Two independent 8xH100 runs confirm **~1.117 BPB** with SDPA/FA2 attention.
+The gap to FA3 (which gives ~85ms/step) is ~15ms/step = ~1000 more training steps.
+With those extra steps, projected BPB: **~1.112-1.114** (crosses record threshold).
+
+**Blocker**: flash_attn_interface (FA3 Hopper kernels) cannot be pip-installed on
+PyTorch 2.11 due to CUDA version mismatch. Needs either:
+1. A pre-built image with FA3 + PyTorch 2.9+
+2. Building from Dao-AILab/flash-attention Hopper branch with matching CUDA
