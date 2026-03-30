@@ -91,7 +91,7 @@ export SWA_ENABLED=1 SWA_EVERY=50
 export LATE_QAT_THRESHOLD=0.15
 export XSA_LAST_N=11
 export BIGRAM_VOCAB_SIZE=2816 BIGRAM_DIM=112
-export USE_GPTQ=1 GPTQ_RESERVE_MS=14000
+export USE_GPTQ=1 GPTQ_RESERVE_MS=9000
 export TTT_ENABLED=0
 
 torchrun --standalone --nproc_per_node=$NGPU train_gpt_merged.py
