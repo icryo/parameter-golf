@@ -105,3 +105,46 @@ With those extra steps, projected BPB: **~1.112-1.114** (crosses record threshol
 PyTorch 2.11 due to CUDA version mismatch. Needs either:
 1. A pre-built image with FA3 + PyTorch 2.9+
 2. Building from Dao-AILab/flash-attention Hopper branch with matching CUDA
+
+## Run 3: 8xH100 Node 3 — FA3 + PR #1089 Innovations (THE RUN)
+
+- **PyTorch**: 2.9.1+cu128
+- **FlashAttention 3**: YES (pre-built wheel, flash_attn_3-3.0.0)
+- **ms/step**: 87.9ms (FA3!)
+- **Steps**: 6,667 (vs 5,847 with SDPA — 14% more)
+- **Artifact**: 15.71 MB
+
+### Innovations ported from PR #1089:
+- EngramLite (8192 buckets, 2 heads, 2 orders, 32 dim/head)
+- Sigmoid-gated skip connections
+- LeakyReLU(0.3)²
+- Turbo-Muon (4 NS steps)
+- LR floor 0.05
+
+### Results
+
+| Metric | BPB |
+|--------|-----|
+| Val @ step 4000 | 1.2005 |
+| Val @ step 6667 (final) | 1.1356 |
+| Post-EMA diagnostic | 1.1339 |
+| Int6 roundtrip | 1.1381 |
+| **Sliding window s64** | **1.1146** |
+
+### Comparison
+
+| Submission | BPB | Delta |
+|-----------|-----|-------|
+| PR #1089 (#1, Turbo-Muon+EngramLite) | 1.1086 | +0.0060 |
+| PR #1060 (coprime+GPTQ+XSA-all) | 1.1122 | +0.0024 |
+| **Our Run 3 (FA3 + ported innovations)** | **1.1146** | — |
+| Record threshold (vs merged SOTA) | 1.1144 | +0.0002 |
+| Merged SOTA (PR #549) | 1.1194 | -0.0048 |
+
+**0.0002 BPP from record threshold.** Within seed variance (std ~0.0005).
+
+### What we're still missing vs PR #1089:
+- Mixed int6/int7 quantization (Hessian sensitivity-based bit allocation)
+- Brotli + byte-shuffle compression
+- Soft-round QAT
+- AOL Polar Express coefficients (we have 4 NS steps but standard coefficients)
