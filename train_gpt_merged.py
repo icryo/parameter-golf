@@ -139,6 +139,7 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
+    lr_floor = float(os.environ.get("LR_FLOOR", 0.05))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -161,7 +162,7 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 4))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -176,6 +177,10 @@ class Hyperparameters:
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", 8192))
+    ngram_heads = int(os.environ.get("NGRAM_HEADS", 2))
+    ngram_orders = int(os.environ.get("NGRAM_ORDERS", 2))
+    ngram_dim_per_head = int(os.environ.get("NGRAM_DIM_PER_HEAD", 32))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -191,7 +196,7 @@ class Hyperparameters:
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     ttt_reset_every = int(os.environ.get("TTT_RESET_EVERY", 0))
-    negative_slope = float(os.environ.get("NEGATIVE_SLOPE", 0.5))
+    negative_slope = float(os.environ.get("NEGATIVE_SLOPE", 0.3))
     use_gptq = bool(int(os.environ.get("USE_GPTQ", "0")))
     gptq_calib_samples = int(os.environ.get("GPTQ_CALIB_SAMPLES", "64"))
     gptq_reserve_ms = float(os.environ.get("GPTQ_RESERVE_MS", "14000"))
@@ -462,7 +467,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gates,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,ngram_gate",
     ).split(",")
     if pattern
 )
@@ -882,28 +887,47 @@ class SmearGate(nn.Module):
         x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
         return (1 - g) * x + g * x_prev
 
-class BigramHashEmbedding(nn.Module):
-    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+class EngramLite(nn.Module):
+    """Multi-head, multi-order n-gram hash embedding with learned sigmoid gating."""
+    def __init__(self, num_buckets: int, num_heads: int, num_orders: int,
+                 dim_per_head: int, model_dim: int):
         super().__init__()
-        self.bigram_vocab_size = bigram_vocab_size
-        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
-        nn.init.zeros_(self.embed.weight)
-        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
-        if self.proj is not None:
-            nn.init.zeros_(self.proj.weight)
-        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
-    def bigram_hash(self, tokens: Tensor) -> Tensor:
-        t = tokens.to(torch.int32)
-        mod = self.bigram_vocab_size - 1
-        out = torch.empty_like(t)
-        out[..., 0] = mod
-        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
-        return out.long()
-    def forward(self, token_ids: Tensor) -> Tensor:
-        h = self.embed(self.bigram_hash(token_ids))
-        if self.proj is not None:
-            h = self.proj(h)
-        return h * self.scale.to(dtype=h.dtype)
+        self.num_buckets = num_buckets
+        self.num_heads = num_heads
+        self.num_orders = num_orders
+        self.dim_per_head = dim_per_head
+        total_buckets = num_orders * num_heads * num_buckets
+        total_dim = num_orders * num_heads * dim_per_head
+        self.embed = nn.Embedding(total_buckets, dim_per_head)
+        nn.init.normal_(self.embed.weight, std=0.01)
+        self.proj = CastedLinear(total_dim, model_dim, bias=False)
+        self.proj._zero_init = True
+        self.ngram_gate = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        N = self.num_buckets
+        curr = input_ids
+        prev = F.pad(curr[:, :-1], (1, 0), value=0)
+
+        # Bigram hashes (2 heads)
+        h0 = (prev * 1009 + curr) % N
+        h1 = (prev * 2719 + 314159 ^ curr * 3137) % N
+        indices = [h0, h1 + N]
+
+        # Trigram hashes (2 heads) if num_orders >= 2
+        if self.num_orders >= 2:
+            prev2 = F.pad(prev[:, :-1], (1, 0), value=0)
+            h2 = (prev2 * 36313 ^ prev * 27191 ^ curr * 4903) % N
+            h3 = (prev2 * 7919 ^ prev * 4391 ^ curr * 6151) % N
+            offset = 2 * N
+            indices.extend([h2 + offset, h3 + offset + N])
+
+        stacked = torch.stack(indices, dim=-1)  # (B, T, num_heads*num_orders)
+        emb = self.embed(stacked)                # (B, T, num_heads*num_orders, dim_per_head)
+        flat = emb.reshape(*input_ids.shape, -1) # (B, T, total_dim)
+        out = self.proj(flat)
+        gate = torch.sigmoid(self.ngram_gate.to(dtype=out.dtype))[None, None, :]
+        return out * gate
 
 class ValueEmbedding(nn.Module):
     """Reinject token identity into attention values at specific layers.
@@ -923,14 +947,14 @@ class ValueEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int, neg_slope: float = 0.5):
+    def __init__(self, dim: int, mlp_mult: int, neg_slope: float = 0.3):
         super().__init__()
         self.neg_slope = neg_slope
         # No CastedLinear -- weights come from banks
     def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
         if getattr(self, '_save_gptq', False):
             self._gptq_up_in = x.detach()
-        if HAS_FUSED_MLP and x.is_cuda and not IS_ROCM and not getattr(self, '_save_gptq', False):
+        if HAS_FUSED_MLP and x.is_cuda and not IS_ROCM and not getattr(self, '_save_gptq', False) and self.neg_slope == 0.5:
             return FusedLeakyReLUSqMLP.apply(x, up_w.to(x.dtype), down_w.to(x.dtype))
         x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=self.neg_slope)
         x2 = x.square()
@@ -949,7 +973,7 @@ class Block(nn.Module):
         qk_gain_init: float,
         layer_idx: int = 0,
         ln_scale: bool = False,
-        neg_slope: float = 0.5,
+        neg_slope: float = 0.3,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -985,13 +1009,17 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
+        ngram_buckets: int = 0,
+        ngram_heads: int = 2,
+        ngram_orders: int = 2,
+        ngram_dim_per_head: int = 32,
         xsa_last_n: int = 0,
         rope_dims: int = 0,
         ln_scale: bool = False,
         ve_enabled: bool = False,
         ve_dim: int = 128,
         ve_layers: str = "9,10",
-        neg_slope: float = 0.5,
+        neg_slope: float = 0.3,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -1001,12 +1029,20 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        # EngramLite replaces BigramHashEmbedding: multi-head multi-order n-gram hashing
+        if ngram_buckets > 0:
+            self.bigram = EngramLite(ngram_buckets, ngram_heads, ngram_orders, ngram_dim_per_head, model_dim)
+        elif bigram_vocab_size > 0:
+            # Legacy fallback (not used by PR #1089)
+            self.bigram = EngramLite(bigram_vocab_size, 2, 2, 32, model_dim)
+        else:
+            self.bigram = None
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
         # Parameter banks: contiguous 3D tensors for batched optimizer
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
@@ -1108,7 +1144,10 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                skip_out = skips.pop()
+                gate = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))[None, None, :]
+                weighted_skip = self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip_out
+                x = torch.lerp(weighted_skip, x, gate)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
@@ -1146,7 +1185,10 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                skip_out = skips.pop()
+                gate = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))[None, None, :]
+                weighted_skip = self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip_out
+                x = torch.lerp(weighted_skip, x, gate)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
@@ -1758,6 +1800,10 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        ngram_buckets=args.ngram_buckets,
+        ngram_heads=args.ngram_heads,
+        ngram_orders=args.ngram_orders,
+        ngram_dim_per_head=args.ngram_dim_per_head,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
@@ -1797,15 +1843,15 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if hasattr(base_model, 'skip_gates') and base_model.skip_gates.numel() > 0:
+        scalar_params.append(base_model.skip_gates)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
-        scalar_params.append(base_model.bigram.scale)
+        scalar_params.append(base_model.bigram.ngram_gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
         tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
-        if base_model.bigram.proj is not None:
-            scalar_params.append(base_model.bigram.proj.weight)
     if base_model.ve_shared is not None:
         tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.ve_shared.proj is not None:
@@ -1854,6 +1900,19 @@ def main() -> None:
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if optimizer_head is not None:
         optimizers.append(optimizer_head)
+    # EngramLite proj uses its own Muon optimizer (small matrix, not worth banking)
+    if base_model.bigram is not None and base_model.bigram.proj is not None:
+        optimizer_ngram_proj = Muon(
+            [base_model.bigram.proj.weight],
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+            weight_decay=args.muon_wd,
+        )
+        for group in optimizer_ngram_proj.param_groups:
+            group["base_lr"] = args.matrix_lr
+        optimizers.append(optimizer_ngram_proj)
+        replicated_params.append(base_model.bigram.proj.weight)
     log0(f"model_params:{sum(p.numel() for p in base_model.parameters())}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
@@ -1884,11 +1943,15 @@ def main() -> None:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+            if warmdown_start <= step < args.iterations:
+                return max((args.iterations - step) / max(args.warmdown_iters, 1), args.lr_floor)
+            return 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        if remaining_ms <= warmdown_ms:
+            return max(remaining_ms / max(warmdown_ms, 1e-9), args.lr_floor)
+        return 1.0
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -2094,6 +2157,8 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        ngram_buckets=args.ngram_buckets, ngram_heads=args.ngram_heads,
+        ngram_orders=args.ngram_orders, ngram_dim_per_head=args.ngram_dim_per_head,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
